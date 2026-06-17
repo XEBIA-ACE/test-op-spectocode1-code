@@ -13,7 +13,7 @@
     <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
     <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
-    <!-- SMS service integration: Twilio SDK for sending verification SMS messages -->
+    <!-- Twilio SDK for SMS dispatch -->
     <PackageReference Include="Twilio" Version="7.3.0" />
   </ItemGroup>
 
