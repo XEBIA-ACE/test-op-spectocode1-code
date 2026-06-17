@@ -1,57 +1,44 @@
-using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
+using System.Text.RegularExpressions;
 using ApiGateway.Models;
 using ApiGateway.Services;
 
 namespace ApiGateway.Controllers
 {
-    /// <summary>
-    /// Handles authentication and MFA operations.
-    ///
-    /// Flow:
-    ///   1. POST /api/auth/token          – first-factor login; returns a step-1 JWT
-    ///                                      (mfa_verified=false).
-    ///   2. GET  /api/auth/mfa/setup      – (authenticated) returns TOTP secret +
-    ///                                      provisioning URI for the authenticator app.
-    ///   3. POST /api/auth/mfa/verify     – (authenticated) validates the TOTP code;
-    ///                                      on success returns a fully-verified JWT
-    ///                                      (mfa_verified=true).
-    /// </summary>
     [ApiController]
     [Route("api/[controller]")]
     public class AuthController : ControllerBase
     {
         private readonly IConfiguration _configuration;
         private readonly ILogger<AuthController> _logger;
-        private readonly IMfaService _mfaService;
+        private readonly IEmailSender _emailSender;
 
-        // In-memory store for demo purposes only.
-        // Production code should persist secrets in a secure user store.
-        private static readonly Dictionary<string, string> _userMfaSecrets = new(StringComparer.OrdinalIgnoreCase);
+        // RFC 5322-inspired regex for high-fidelity email validation.
+        // Covers the vast majority of real-world addresses while rejecting clearly malformed ones.
+        private static readonly Regex EmailRegex = new(
+            @"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase,
+            TimeSpan.FromMilliseconds(100));
 
         public AuthController(
             IConfiguration configuration,
             ILogger<AuthController> logger,
-            IMfaService mfaService)
+            IEmailSender emailSender)
         {
             _configuration = configuration;
             _logger = logger;
-            _mfaService = mfaService;
+            _emailSender = emailSender;
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Step 1 – First-factor login
-        // ─────────────────────────────────────────────────────────────────────
-
         /// <summary>
-        /// Validates username/password and returns a step-1 JWT.
-        /// The token carries <c>mfa_verified=false</c> until the second factor
-        /// is completed via <c>POST /api/auth/mfa/verify</c>.
+        /// Generate JWT token for testing purposes.
         /// </summary>
+        /// <param name="request">Login request containing username and password.</param>
+        /// <returns>JWT token on success; 400 on missing credentials.</returns>
         [HttpPost("token")]
         [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
@@ -59,159 +46,148 @@ namespace ApiGateway.Controllers
         {
             _logger.LogInformation("Token generation requested for user: {Username}", request.Username);
 
-            if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password))
+            try
             {
-                return BadRequest(new ErrorResponse
+                // Simple validation for demo purposes
+                if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password))
                 {
-                    Error = "InvalidCredentials",
-                    Message = "Username and password are required",
-                    StatusCode = 400
+                    return BadRequest(new ErrorResponse
+                    {
+                        Error = "InvalidCredentials",
+                        Message = "Username and password are required",
+                        StatusCode = 400
+                    });
+                }
+
+                // For demo purposes, accept any non-empty credentials.
+                // In production, validate against a user store.
+                var tokenHandler = new JwtSecurityTokenHandler();
+                var key = Encoding.UTF8.GetBytes(
+                    _configuration["Jwt:Key"] ?? "default-secret-key-for-development");
+
+                var tokenDescriptor = new SecurityTokenDescriptor
+                {
+                    Subject = new ClaimsIdentity(new[]
+                    {
+                        new Claim(ClaimTypes.Name, request.Username),
+                        new Claim(ClaimTypes.NameIdentifier, Guid.NewGuid().ToString()),
+                        new Claim("username", request.Username)
+                    }),
+                    Expires = DateTime.UtcNow.AddHours(1),
+                    Issuer = _configuration["Jwt:Issuer"],
+                    Audience = _configuration["Jwt:Audience"],
+                    SigningCredentials = new SigningCredentials(
+                        new SymmetricSecurityKey(key),
+                        SecurityAlgorithms.HmacSha256Signature)
+                };
+
+                var token = tokenHandler.CreateToken(tokenDescriptor);
+                var tokenString = tokenHandler.WriteToken(token);
+
+                _logger.LogInformation("Token generated successfully for user: {Username}", request.Username);
+
+                return Ok(new
+                {
+                    token = tokenString,
+                    expires = tokenDescriptor.Expires,
+                    tokenType = "Bearer"
                 });
             }
-
-            // Demo: accept any non-empty credentials.
-            // Production: validate against a user store.
-            var token = BuildJwt(request.Username, mfaVerified: false, expiryHours: 1);
-
-            _logger.LogInformation("Step-1 token issued for user: {Username}", request.Username);
-
-            return Ok(new
+            catch (Exception ex)
             {
-                token,
-                mfaRequired = true,
-                message = "First-factor authentication successful. Complete MFA to obtain full access."
-            });
+                _logger.LogError(ex, "Error generating token for user: {Username}", request.Username);
+                return StatusCode(StatusCodes.Status500InternalServerError, new ErrorResponse
+                {
+                    Error = "TokenGenerationFailed",
+                    Message = "An error occurred while generating the token",
+                    StatusCode = 500
+                });
+            }
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Step 2a – MFA setup (returns TOTP secret + provisioning URI)
-        // ─────────────────────────────────────────────────────────────────────
-
         /// <summary>
-        /// Returns a new TOTP secret and provisioning URI for the authenticated user.
-        /// The caller should display the URI as a QR code for the authenticator app.
+        /// Register a user by email address and trigger a verification email.
         /// </summary>
-        [HttpGet("mfa/setup")]
-        [Authorize]
-        [ProducesResponseType(typeof(MfaSetupResponse), StatusCodes.Status200OK)]
-        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-        public IActionResult MfaSetup()
-        {
-            var username = User.Identity?.Name ?? User.FindFirstValue("username") ?? "unknown";
-            _logger.LogInformation("MFA setup requested for user: {Username}", username);
-
-            var secret = _mfaService.GenerateSecret();
-
-            // Persist the secret so it can be validated during verify
-            _userMfaSecrets[username] = secret;
-
-            var issuer = _configuration["Mfa:IssuerName"] ?? _configuration["Jwt:Issuer"] ?? "ApiGateway";
-            var provisioningUri = _mfaService.GetProvisioningUri(secret, username, issuer);
-
-            return Ok(new MfaSetupResponse
-            {
-                Secret = secret,
-                ProvisioningUri = provisioningUri,
-                IssuerName = issuer
-            });
-        }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // Step 2b – MFA verification (validates TOTP code, issues full token)
-        // ─────────────────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Validates the 6-digit TOTP code supplied by the user.
-        /// On success, returns a fully-authenticated JWT (<c>mfa_verified=true</c>).
-        /// On failure, returns 401 – access is denied (spec AC).
-        /// </summary>
-        [HttpPost("mfa/verify")]
-        [Authorize]
-        [ProducesResponseType(typeof(MfaVerifyResponse), StatusCodes.Status200OK)]
+        /// <remarks>
+        /// - Returns 400 if the email format is invalid (RFC 5322 check).
+        /// - Returns 200 regardless of whether the address is already registered
+        ///   to prevent user-enumeration attacks.
+        /// - Returns 500 if the downstream email service is unavailable.
+        /// </remarks>
+        /// <param name="request">Registration request containing the email address.</param>
+        /// <returns>200 OK on success; 400 on invalid input; 500 on email delivery failure.</returns>
+        [HttpPost("register")]
+        [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status401Unauthorized)]
-        public IActionResult MfaVerify([FromBody] MfaVerifyRequest request)
+        [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status500InternalServerError)]
+        public async Task<IActionResult> Register([FromBody] RegisterEmailRequest request)
         {
-            var username = User.Identity?.Name ?? User.FindFirstValue("username") ?? "unknown";
-            _logger.LogInformation("MFA verification attempt for user: {Username}", username);
+            _logger.LogInformation("Registration attempt received");
 
-            if (string.IsNullOrWhiteSpace(request.Code))
+            // Null / missing body guard
+            if (request == null)
             {
                 return BadRequest(new ErrorResponse
                 {
-                    Error = "InvalidCode",
-                    Message = "MFA code is required",
+                    Error = "InvalidRequest",
+                    Message = "Request body is required",
                     StatusCode = 400
                 });
             }
 
-            // Retrieve the stored secret for this user
-            if (!_userMfaSecrets.TryGetValue(username, out var secret))
+            // Trim and normalise before validation (constitution: inputs must be trimmed/case-normalised)
+            var email = (request.Email ?? string.Empty).Trim().ToLowerInvariant();
+
+            if (string.IsNullOrEmpty(email) || !EmailRegex.IsMatch(email))
             {
-                _logger.LogWarning("No MFA secret found for user: {Username}", username);
-                return Unauthorized(new ErrorResponse
+                _logger.LogWarning("Registration rejected: invalid email format");
+                return BadRequest(new ErrorResponse
                 {
-                    Error = "MfaNotConfigured",
-                    Message = "MFA has not been set up for this account. Call GET /api/auth/mfa/setup first.",
-                    StatusCode = 401
+                    Error = "InvalidEmail",
+                    Message = "The provided email address is not valid",
+                    StatusCode = 400
                 });
             }
 
-            // Validate the TOTP code
-            if (!_mfaService.ValidateCode(secret, request.Code))
+            try
             {
-                _logger.LogWarning("Invalid MFA code provided for user: {Username}", username);
-                // Spec AC: "when they provide an incorrect code, then access is denied"
-                return Unauthorized(new ErrorResponse
+                // Send verification email asynchronously.
+                // Persistence / user creation is out-of-scope for this story.
+                await _emailSender.SendEmailAsync(
+                    email,
+                    "Verify your email address",
+                    "Please verify your email address by clicking the link in this message.");
+
+                _logger.LogInformation("Verification email dispatched (email omitted for PII)");
+
+                // Always return 200 for valid emails — do not reveal registration status
+                // to prevent user enumeration (constitution + spec requirement).
+                return Ok(new
                 {
-                    Error = "InvalidMfaCode",
-                    Message = "The provided MFA code is incorrect or has expired.",
-                    StatusCode = 401
+                    message = "If this email address is valid, a verification email has been sent."
                 });
             }
-
-            // Issue a fully-verified token
-            var expiresAt = DateTime.UtcNow.AddHours(1);
-            var token = BuildJwt(username, mfaVerified: true, expiryHours: 1);
-
-            _logger.LogInformation("MFA verification successful for user: {Username}", username);
-
-            return Ok(new MfaVerifyResponse
+            catch (Exception ex)
             {
-                Token = token,
-                ExpiresAt = expiresAt
-            });
-        }
+                // Log without PII beyond what is operationally necessary
+                _logger.LogError(ex, "Email delivery failed during registration");
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Private helpers
-        // ─────────────────────────────────────────────────────────────────────
-
-        private string BuildJwt(string username, bool mfaVerified, int expiryHours)
-        {
-            var key = Encoding.UTF8.GetBytes(
-                _configuration["Jwt:Key"] ?? "default-secret-key-for-development");
-
-            var tokenDescriptor = new SecurityTokenDescriptor
-            {
-                Subject = new ClaimsIdentity(new[]
+                return StatusCode(StatusCodes.Status500InternalServerError, new ErrorResponse
                 {
-                    new Claim(ClaimTypes.Name, username),
-                    new Claim(ClaimTypes.NameIdentifier, Guid.NewGuid().ToString()),
-                    new Claim("username", username),
-                    new Claim("mfa_verified", mfaVerified.ToString().ToLower())
-                }),
-                Expires = DateTime.UtcNow.AddHours(expiryHours),
-                Issuer = _configuration["Jwt:Issuer"],
-                Audience = _configuration["Jwt:Audience"],
-                SigningCredentials = new SigningCredentials(
-                    new SymmetricSecurityKey(key),
-                    SecurityAlgorithms.HmacSha256Signature)
-            };
-
-            var handler = new JwtSecurityTokenHandler();
-            var token = handler.CreateToken(tokenDescriptor);
-            return handler.WriteToken(token);
+                    Error = "EmailDeliveryFailed",
+                    Message = "Unable to send verification email. Please try again later.",
+                    StatusCode = 500
+                });
+            }
         }
+    }
+
+    /// <summary>
+    /// Request model for the token endpoint.
+    /// </summary>
+    public class LoginRequest
+    {
+        public string Username { get; set; } = string.Empty;
+        public string Password { get; set; } = string.Empty;
     }
 }
