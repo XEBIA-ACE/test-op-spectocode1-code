@@ -15,30 +15,27 @@ namespace ApiGateway.Controllers
     {
         private readonly IConfiguration _configuration;
         private readonly ILogger<AuthController> _logger;
-        private readonly IEmailSender _emailSender;
+        private readonly ISmsService _smsService;
 
-        // RFC 5322-inspired regex for high-fidelity email validation.
-        // Covers the vast majority of real-world addresses while rejecting clearly malformed ones.
-        private static readonly Regex EmailRegex = new(
-            @"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase,
-            TimeSpan.FromMilliseconds(100));
+        // E.164 international phone number format: +[country code][number], 7-15 digits total.
+        private static readonly Regex PhoneNumberRegex =
+            new(@"^\+[1-9]\d{6,14}$", RegexOptions.Compiled);
 
         public AuthController(
             IConfiguration configuration,
             ILogger<AuthController> logger,
-            IEmailSender emailSender)
+            ISmsService smsService)
         {
             _configuration = configuration;
             _logger = logger;
-            _emailSender = emailSender;
+            _smsService = smsService;
         }
 
         /// <summary>
         /// Generate JWT token for testing purposes.
         /// </summary>
-        /// <param name="request">Login request containing username and password.</param>
-        /// <returns>JWT token on success; 400 on missing credentials.</returns>
+        /// <param name="request">Login request</param>
+        /// <returns>JWT token</returns>
         [HttpPost("token")]
         [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
@@ -60,7 +57,7 @@ namespace ApiGateway.Controllers
                 }
 
                 // For demo purposes, accept any non-empty credentials.
-                // In production, validate against a user store.
+                // In production, this would validate against a user store.
                 var tokenHandler = new JwtSecurityTokenHandler();
                 var key = Encoding.UTF8.GetBytes(
                     _configuration["Jwt:Key"] ?? "default-secret-key-for-development");
@@ -89,8 +86,7 @@ namespace ApiGateway.Controllers
                 return Ok(new
                 {
                     token = tokenString,
-                    expires = tokenDescriptor.Expires,
-                    tokenType = "Bearer"
+                    expires = tokenDescriptor.Expires
                 });
             }
             catch (Exception ex)
@@ -106,82 +102,66 @@ namespace ApiGateway.Controllers
         }
 
         /// <summary>
-        /// Register a user by email address and trigger a verification email.
+        /// Register a phone number and send a verification SMS.
+        /// Validates the phone number format (E.164) before dispatching the SMS.
         /// </summary>
-        /// <remarks>
-        /// - Returns 400 if the email format is invalid (RFC 5322).
-        /// - Returns 200 regardless of whether the address is already registered
-        ///   (prevents user enumeration).
-        /// - Returns 500 if the email delivery system is unavailable.
-        /// </remarks>
-        /// <param name="request">Registration request containing the email address.</param>
-        /// <returns>200 OK on success; 400 on invalid input; 500 on delivery failure.</returns>
-        [HttpPost("register")]
+        /// <param name="request">Phone registration request containing the phone number.</param>
+        /// <returns>200 OK when the SMS is dispatched; 400 for invalid format; 500 on send failure.</returns>
+        [HttpPost("register/phone")]
         [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status500InternalServerError)]
-        public async Task<IActionResult> Register([FromBody] RegisterEmailRequest request)
+        public async Task<IActionResult> RegisterPhone([FromBody] PhoneRegistrationRequest request)
         {
-            _logger.LogInformation("Registration attempt received");
+            _logger.LogInformation("Phone registration requested for number: {PhoneNumber}", request.PhoneNumber);
 
-            // Null / missing body guard
-            if (request == null)
+            // Validate phone number format (E.164 international standard).
+            if (string.IsNullOrWhiteSpace(request.PhoneNumber) ||
+                !PhoneNumberRegex.IsMatch(request.PhoneNumber))
             {
+                _logger.LogWarning(
+                    "Invalid phone number format received: {PhoneNumber}", request.PhoneNumber);
+
                 return BadRequest(new ErrorResponse
                 {
-                    Error = "InvalidRequest",
-                    Message = "Request body is required",
+                    Error = "InvalidPhoneNumber",
+                    Message = "Phone number must be in E.164 format (e.g. +14155552671).",
                     StatusCode = 400
                 });
             }
 
-            // Trim and normalise before validation (constitution: inputs must be trimmed/case-normalised)
-            var email = (request.Email ?? string.Empty).Trim().ToLowerInvariant();
+            // Phone number is valid — send verification SMS.
+            const string verificationMessage =
+                "Your verification code has been sent. Please use it to complete your registration.";
 
-            if (string.IsNullOrEmpty(email) || !EmailRegex.IsMatch(email))
+            var sent = await _smsService.SendSmsAsync(request.PhoneNumber, verificationMessage);
+
+            if (!sent)
             {
-                _logger.LogWarning("Registration rejected: invalid email format");
-                return BadRequest(new ErrorResponse
-                {
-                    Error = "InvalidEmail",
-                    Message = "The provided email address is not valid",
-                    StatusCode = 400
-                });
-            }
-
-            try
-            {
-                // Send verification email. Persistence / user creation is out-of-scope for this story.
-                await _emailSender.SendEmailAsync(
-                    email,
-                    "Verify your email address",
-                    "Please verify your email address to complete registration.");
-
-                _logger.LogInformation("Verification email dispatched (email omitted for PII)");
-
-                // Always return 200 for a valid email — do not reveal registration status.
-                return Ok(new
-                {
-                    message = "If this email address is valid, a verification email has been sent."
-                });
-            }
-            catch (Exception ex)
-            {
-                // Log without PII beyond what is operationally necessary.
-                _logger.LogError(ex, "Failed to send verification email");
+                _logger.LogError(
+                    "Failed to send verification SMS to {PhoneNumber}", request.PhoneNumber);
 
                 return StatusCode(StatusCodes.Status500InternalServerError, new ErrorResponse
                 {
-                    Error = "EmailDeliveryFailed",
-                    Message = "Unable to send verification email. Please try again later.",
+                    Error = "SmsSendFailed",
+                    Message = "Verification SMS could not be sent. Please try again later.",
                     StatusCode = 500
                 });
             }
+
+            _logger.LogInformation(
+                "Verification SMS sent successfully to {PhoneNumber}", request.PhoneNumber);
+
+            return Ok(new
+            {
+                message = "Verification SMS sent successfully.",
+                phoneNumber = request.PhoneNumber
+            });
         }
     }
 
     /// <summary>
-    /// Request model for the token endpoint.
+    /// Login request model used by the token endpoint.
     /// </summary>
     public class LoginRequest
     {

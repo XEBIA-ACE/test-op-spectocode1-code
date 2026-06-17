@@ -21,8 +21,9 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// Register MFA service (scoped so it can be mocked in integration tests)
-builder.Services.AddScoped<IMfaService, MfaService>();
+// Register SMS sending service (Twilio-backed).
+// Credentials are read from the "Twilio" section of appsettings.json.
+builder.Services.AddSingleton<ISmsService, TwilioSmsService>();
 
 // Configure JWT Authentication
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -72,6 +73,3 @@ finally
 {
     Log.CloseAndFlush();
 }
-
-// Expose Program as a partial class so WebApplicationFactory<Program> works in tests
-public partial class Program { }
