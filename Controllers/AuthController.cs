@@ -109,13 +109,13 @@ namespace ApiGateway.Controllers
         /// Register a user by email address and trigger a verification email.
         /// </summary>
         /// <remarks>
-        /// - Returns 400 if the email format is invalid (RFC 5322 check).
+        /// - Returns 400 if the email format is invalid (RFC 5322).
         /// - Returns 200 regardless of whether the address is already registered
-        ///   to prevent user-enumeration attacks.
-        /// - Returns 500 if the downstream email service is unavailable.
+        ///   (prevents user enumeration).
+        /// - Returns 500 if the email delivery system is unavailable.
         /// </remarks>
         /// <param name="request">Registration request containing the email address.</param>
-        /// <returns>200 OK on success; 400 on invalid input; 500 on email delivery failure.</returns>
+        /// <returns>200 OK on success; 400 on invalid input; 500 on delivery failure.</returns>
         [HttpPost("register")]
         [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
@@ -151,17 +151,15 @@ namespace ApiGateway.Controllers
 
             try
             {
-                // Send verification email asynchronously.
-                // Persistence / user creation is out-of-scope for this story.
+                // Send verification email. Persistence / user creation is out-of-scope for this story.
                 await _emailSender.SendEmailAsync(
                     email,
                     "Verify your email address",
-                    "Please verify your email address by clicking the link in this message.");
+                    "Please verify your email address to complete registration.");
 
                 _logger.LogInformation("Verification email dispatched (email omitted for PII)");
 
-                // Always return 200 for valid emails — do not reveal registration status
-                // to prevent user enumeration (constitution + spec requirement).
+                // Always return 200 for a valid email — do not reveal registration status.
                 return Ok(new
                 {
                     message = "If this email address is valid, a verification email has been sent."
@@ -169,8 +167,8 @@ namespace ApiGateway.Controllers
             }
             catch (Exception ex)
             {
-                // Log without PII beyond what is operationally necessary
-                _logger.LogError(ex, "Email delivery failed during registration");
+                // Log without PII beyond what is operationally necessary.
+                _logger.LogError(ex, "Failed to send verification email");
 
                 return StatusCode(StatusCodes.Status500InternalServerError, new ErrorResponse
                 {

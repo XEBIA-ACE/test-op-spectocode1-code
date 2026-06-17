@@ -11,9 +11,9 @@ namespace ApiGateway.Services
         /// </summary>
         /// <param name="toEmail">Recipient email address.</param>
         /// <param name="subject">Email subject line.</param>
-        /// <param name="body">Email body content (plain text or HTML).</param>
+        /// <param name="body">Email body (plain text or HTML).</param>
         /// <exception cref="InvalidOperationException">
-        /// Thrown when the underlying mail transport is unavailable or rejects the message.
+        /// Thrown when the underlying mail transport is unavailable.
         /// </exception>
         Task SendEmailAsync(string toEmail, string subject, string body);
     }

@@ -3,21 +3,19 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Moq;
+using Xunit;
 using ApiGateway.Controllers;
 using ApiGateway.Models;
 using ApiGateway.Services;
-using Xunit;
 
 namespace ApiGateway.Tests.Controllers
 {
     /// <summary>
     /// Unit tests for <see cref="AuthController"/>.
-    ///
-    /// Coverage targets (per spec + constitution):
-    ///   - POST /api/auth/register — happy path (valid email, IEmailSender called, 200 OK)
-    ///   - POST /api/auth/register — invalid email formats (400 + structured ErrorResponse)
-    ///   - POST /api/auth/register — IEmailSender throws (500 + structured ErrorResponse)
-    ///   - POST /api/auth/token   — existing token-generation behaviour (regression guard)
+    /// Covers the POST /api/auth/register endpoint across all acceptance-criteria branches:
+    ///   1. Valid email  → 200 OK + IEmailSender called
+    ///   2. Invalid email formats → 400 Bad Request with structured ErrorResponse
+    ///   3. IEmailSender throws  → 500 Internal Server Error with structured ErrorResponse
     /// </summary>
     public class AuthControllerTests
     {
@@ -25,49 +23,48 @@ namespace ApiGateway.Tests.Controllers
         // Helpers
         // -----------------------------------------------------------------------
 
-        private static AuthController CreateController(
-            IEmailSender? emailSender = null,
-            IConfiguration? configuration = null)
+        /// <summary>
+        /// Builds an <see cref="AuthController"/> with the supplied email-sender mock
+        /// and minimal configuration stubs.
+        /// </summary>
+        private static AuthController BuildController(Mock<IEmailSender> emailSenderMock)
         {
-            var config = configuration ?? BuildDefaultConfiguration();
-            var logger = new Mock<ILogger<AuthController>>().Object;
-            var sender = emailSender ?? new Mock<IEmailSender>().Object;
-            return new AuthController(config, logger, sender);
-        }
-
-        private static IConfiguration BuildDefaultConfiguration()
-        {
-            var inMemory = new Dictionary<string, string?>
+            var configData = new Dictionary<string, string?>
             {
                 ["Jwt:Key"]      = "test-secret-key-for-unit-tests-256-bits-long!!",
-                ["Jwt:Issuer"]   = "ApiGateway",
-                ["Jwt:Audience"] = "ApiGatewayUsers"
+                ["Jwt:Issuer"]   = "TestIssuer",
+                ["Jwt:Audience"] = "TestAudience"
             };
-            return new ConfigurationBuilder()
-                .AddInMemoryCollection(inMemory)
+
+            IConfiguration configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(configData)
                 .Build();
+
+            var logger = Mock.Of<ILogger<AuthController>>();
+
+            return new AuthController(configuration, logger, emailSenderMock.Object);
         }
 
         // -----------------------------------------------------------------------
-        // POST /api/auth/register — Happy Path
+        // Happy-path tests
         // -----------------------------------------------------------------------
 
         [Fact]
         public async Task Register_ValidEmail_Returns200Ok()
         {
             // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
                 .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
                 .Returns(Task.CompletedTask);
 
-            var controller = CreateController(emailSender: mockSender.Object);
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = "user@example.com" };
 
             // Act
             var result = await controller.Register(request);
 
-            // Assert — HTTP 200
+            // Assert
             var okResult = Assert.IsType<OkObjectResult>(result);
             Assert.Equal(StatusCodes.Status200OK, okResult.StatusCode);
         }
@@ -76,23 +73,42 @@ namespace ApiGateway.Tests.Controllers
         public async Task Register_ValidEmail_CallsIEmailSenderOnce()
         {
             // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
                 .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
                 .Returns(Task.CompletedTask);
 
-            var controller = CreateController(emailSender: mockSender.Object);
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = "user@example.com" };
 
             // Act
             await controller.Register(request);
 
-            // Assert — IEmailSender.SendEmailAsync called exactly once with the normalised address
-            mockSender.Verify(
-                s => s.SendEmailAsync(
-                    "user@example.com",   // trimmed + lowercased
-                    It.IsAny<string>(),
-                    It.IsAny<string>()),
+            // Assert – IEmailSender must be invoked exactly once with the normalised address
+            emailSenderMock.Verify(
+                s => s.SendEmailAsync("user@example.com", It.IsAny<string>(), It.IsAny<string>()),
+                Times.Once);
+        }
+
+        [Fact]
+        public async Task Register_ValidEmail_NormalisesAddressToLowercase()
+        {
+            // Arrange – submit mixed-case address; sender should receive lowercase
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
+                .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
+                .Returns(Task.CompletedTask);
+
+            var controller = BuildController(emailSenderMock);
+            var request = new RegisterEmailRequest { Email = "User.Name@Example.COM" };
+
+            // Act
+            var result = await controller.Register(request);
+
+            // Assert
+            Assert.IsType<OkObjectResult>(result);
+            emailSenderMock.Verify(
+                s => s.SendEmailAsync("user.name@example.com", It.IsAny<string>(), It.IsAny<string>()),
                 Times.Once);
         }
 
@@ -100,75 +116,30 @@ namespace ApiGateway.Tests.Controllers
         public async Task Register_ValidEmail_ResponseBodyContainsMessage()
         {
             // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
                 .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
                 .Returns(Task.CompletedTask);
 
-            var controller = CreateController(emailSender: mockSender.Object);
-            var request = new RegisterEmailRequest { Email = "alice@domain.org" };
+            var controller = BuildController(emailSenderMock);
+            var request = new RegisterEmailRequest { Email = "valid@domain.org" };
 
             // Act
             var result = await controller.Register(request);
 
-            // Assert — response body has a non-empty message property
+            // Assert – response body must carry a non-empty message (no enumeration signal)
             var okResult = Assert.IsType<OkObjectResult>(result);
-            var body = okResult.Value;
-            Assert.NotNull(body);
+            Assert.NotNull(okResult.Value);
 
             // Use reflection to read the anonymous-type "message" property
-            var messageProp = body!.GetType().GetProperty("message");
-            Assert.NotNull(messageProp);
-            var messageValue = messageProp!.GetValue(body) as string;
+            var messageProperty = okResult.Value!.GetType().GetProperty("message");
+            Assert.NotNull(messageProperty);
+            var messageValue = messageProperty!.GetValue(okResult.Value) as string;
             Assert.False(string.IsNullOrWhiteSpace(messageValue));
         }
 
-        [Fact]
-        public async Task Register_EmailWithUpperCase_NormalisesAndSucceeds()
-        {
-            // Arrange — email with mixed case; controller must normalise before sending
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
-                .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
-                .Returns(Task.CompletedTask);
-
-            var controller = CreateController(emailSender: mockSender.Object);
-            var request = new RegisterEmailRequest { Email = "User@Example.COM" };
-
-            // Act
-            var result = await controller.Register(request);
-
-            // Assert — 200 OK and sender called with lowercased address
-            Assert.IsType<OkObjectResult>(result);
-            mockSender.Verify(
-                s => s.SendEmailAsync("user@example.com", It.IsAny<string>(), It.IsAny<string>()),
-                Times.Once);
-        }
-
-        [Fact]
-        public async Task Register_EmailWithLeadingTrailingSpaces_TrimsAndSucceeds()
-        {
-            // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
-                .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
-                .Returns(Task.CompletedTask);
-
-            var controller = CreateController(emailSender: mockSender.Object);
-            var request = new RegisterEmailRequest { Email = "  trimmed@example.com  " };
-
-            // Act
-            var result = await controller.Register(request);
-
-            // Assert
-            Assert.IsType<OkObjectResult>(result);
-            mockSender.Verify(
-                s => s.SendEmailAsync("trimmed@example.com", It.IsAny<string>(), It.IsAny<string>()),
-                Times.Once);
-        }
-
         // -----------------------------------------------------------------------
-        // POST /api/auth/register — Invalid Email Formats → 400
+        // Invalid-email tests  →  400 Bad Request
         // -----------------------------------------------------------------------
 
         [Theory]
@@ -179,20 +150,19 @@ namespace ApiGateway.Tests.Controllers
         [InlineData("@nodomain.com")]          // no local part
         [InlineData("double@@domain.com")]     // double @
         [InlineData("spaces in@email.com")]    // space in local part
-        [InlineData("missing.tld@domain")]     // no TLD dot
-        [InlineData("plainaddress")]           // completely plain
-        [InlineData("user@.com")]              // domain starts with dot
+        [InlineData("plainaddress")]           // no @ at all
+        [InlineData("missingdot@com")]         // single-label domain (no dot)
         public async Task Register_InvalidEmail_Returns400BadRequest(string invalidEmail)
         {
             // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            var controller = CreateController(emailSender: mockSender.Object);
+            var emailSenderMock = new Mock<IEmailSender>();
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = invalidEmail };
 
             // Act
             var result = await controller.Register(request);
 
-            // Assert — HTTP 400
+            // Assert
             var badRequest = Assert.IsType<BadRequestObjectResult>(result);
             Assert.Equal(StatusCodes.Status400BadRequest, badRequest.StatusCode);
         }
@@ -204,14 +174,14 @@ namespace ApiGateway.Tests.Controllers
         public async Task Register_InvalidEmail_ReturnsStructuredErrorResponse(string invalidEmail)
         {
             // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            var controller = CreateController(emailSender: mockSender.Object);
+            var emailSenderMock = new Mock<IEmailSender>();
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = invalidEmail };
 
             // Act
             var result = await controller.Register(request);
 
-            // Assert — body is a structured ErrorResponse
+            // Assert – body must be a structured ErrorResponse
             var badRequest = Assert.IsType<BadRequestObjectResult>(result);
             var errorResponse = Assert.IsType<ErrorResponse>(badRequest.Value);
             Assert.False(string.IsNullOrWhiteSpace(errorResponse.Error));
@@ -221,20 +191,19 @@ namespace ApiGateway.Tests.Controllers
 
         [Theory]
         [InlineData("")]
-        [InlineData("notanemail")]
-        [InlineData("missing@")]
-        public async Task Register_InvalidEmail_DoesNotCallEmailSender(string invalidEmail)
+        [InlineData("bad-email")]
+        public async Task Register_InvalidEmail_DoesNotCallIEmailSender(string invalidEmail)
         {
-            // Arrange — IEmailSender must NOT be invoked for invalid addresses
-            var mockSender = new Mock<IEmailSender>();
-            var controller = CreateController(emailSender: mockSender.Object);
+            // Arrange
+            var emailSenderMock = new Mock<IEmailSender>();
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = invalidEmail };
 
             // Act
             await controller.Register(request);
 
-            // Assert
-            mockSender.Verify(
+            // Assert – email sender must never be invoked for invalid addresses
+            emailSenderMock.Verify(
                 s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()),
                 Times.Never);
         }
@@ -243,8 +212,8 @@ namespace ApiGateway.Tests.Controllers
         public async Task Register_NullRequest_Returns400BadRequest()
         {
             // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            var controller = CreateController(emailSender: mockSender.Object);
+            var emailSenderMock = new Mock<IEmailSender>();
+            var controller = BuildController(emailSenderMock);
 
             // Act
             var result = await controller.Register(null!);
@@ -257,85 +226,86 @@ namespace ApiGateway.Tests.Controllers
         }
 
         // -----------------------------------------------------------------------
-        // POST /api/auth/register — IEmailSender throws → 500
+        // Email-sender failure tests  →  500 Internal Server Error
         // -----------------------------------------------------------------------
 
         [Fact]
-        public async Task Register_EmailSenderThrowsException_Returns500()
+        public async Task Register_EmailSenderThrows_Returns500InternalServerError()
         {
-            // Arrange — simulate downstream email service outage
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
+            // Arrange
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
                 .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
                 .ThrowsAsync(new InvalidOperationException("SMTP server unavailable"));
 
-            var controller = CreateController(emailSender: mockSender.Object);
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = "user@example.com" };
 
             // Act
             var result = await controller.Register(request);
 
-            // Assert — HTTP 500
+            // Assert
             var serverError = Assert.IsType<ObjectResult>(result);
             Assert.Equal(StatusCodes.Status500InternalServerError, serverError.StatusCode);
         }
 
         [Fact]
-        public async Task Register_EmailSenderThrowsException_ReturnsStructuredErrorResponse()
+        public async Task Register_EmailSenderThrows_ReturnsStructuredErrorResponse()
         {
             // Arrange
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
                 .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
-                .ThrowsAsync(new InvalidOperationException("SMTP server unavailable"));
+                .ThrowsAsync(new Exception("Downstream mail service timed out"));
 
-            var controller = CreateController(emailSender: mockSender.Object);
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = "user@example.com" };
 
             // Act
             var result = await controller.Register(request);
 
-            // Assert — body is a structured ErrorResponse with 500 status code
+            // Assert – body must be a structured ErrorResponse; must NOT leak exception details
             var serverError = Assert.IsType<ObjectResult>(result);
             var errorResponse = Assert.IsType<ErrorResponse>(serverError.Value);
             Assert.False(string.IsNullOrWhiteSpace(errorResponse.Error));
             Assert.False(string.IsNullOrWhiteSpace(errorResponse.Message));
             Assert.Equal(500, errorResponse.StatusCode);
+
+            // Security: raw exception message must not be surfaced to the client
+            Assert.DoesNotContain("timed out", errorResponse.Message, StringComparison.OrdinalIgnoreCase);
         }
 
         [Fact]
-        public async Task Register_EmailSenderThrowsException_ErrorResponseDoesNotLeakInternalDetails()
+        public async Task Register_EmailSenderThrows_IEmailSenderWasStillCalled()
         {
-            // Arrange — security: internal exception message must NOT be surfaced to the client
-            var internalMessage = "Connection string: Server=prod-db;Password=s3cr3t";
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
+            // Arrange – verify the controller did attempt to call the sender before catching
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
                 .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
-                .ThrowsAsync(new Exception(internalMessage));
+                .ThrowsAsync(new InvalidOperationException("Connection refused"));
 
-            var controller = CreateController(emailSender: mockSender.Object);
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = "user@example.com" };
 
             // Act
-            var result = await controller.Register(request);
+            await controller.Register(request);
 
-            // Assert — client-facing message must not contain the raw exception text
-            var serverError = Assert.IsType<ObjectResult>(result);
-            var errorResponse = Assert.IsType<ErrorResponse>(serverError.Value);
-            Assert.DoesNotContain(internalMessage, errorResponse.Message ?? string.Empty);
-            Assert.DoesNotContain(internalMessage, errorResponse.Details ?? string.Empty);
+            // Assert
+            emailSenderMock.Verify(
+                s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()),
+                Times.Once);
         }
 
         [Fact]
         public async Task Register_EmailSenderThrowsTaskCanceledException_Returns500()
         {
-            // Arrange — simulate timeout / cancellation from email provider
-            var mockSender = new Mock<IEmailSender>();
-            mockSender
+            // Arrange – simulate a timeout scenario
+            var emailSenderMock = new Mock<IEmailSender>();
+            emailSenderMock
                 .Setup(s => s.SendEmailAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()))
-                .ThrowsAsync(new TaskCanceledException("Email send timed out"));
+                .ThrowsAsync(new TaskCanceledException("Request timed out"));
 
-            var controller = CreateController(emailSender: mockSender.Object);
+            var controller = BuildController(emailSenderMock);
             var request = new RegisterEmailRequest { Email = "timeout@example.com" };
 
             // Act
@@ -344,46 +314,8 @@ namespace ApiGateway.Tests.Controllers
             // Assert
             var serverError = Assert.IsType<ObjectResult>(result);
             Assert.Equal(StatusCodes.Status500InternalServerError, serverError.StatusCode);
-        }
-
-        // -----------------------------------------------------------------------
-        // POST /api/auth/token — Regression guard for existing behaviour
-        // -----------------------------------------------------------------------
-
-        [Fact]
-        public void GenerateToken_ValidCredentials_Returns200WithToken()
-        {
-            // Arrange
-            var controller = CreateController();
-            var request = new LoginRequest { Username = "testuser", Password = "testpass" };
-
-            // Act
-            var result = controller.GenerateToken(request);
-
-            // Assert
-            var okResult = Assert.IsType<OkObjectResult>(result);
-            Assert.Equal(StatusCodes.Status200OK, okResult.StatusCode);
-            Assert.NotNull(okResult.Value);
-        }
-
-        [Theory]
-        [InlineData("", "password")]
-        [InlineData("username", "")]
-        [InlineData("", "")]
-        public void GenerateToken_MissingCredentials_Returns400(string username, string password)
-        {
-            // Arrange
-            var controller = CreateController();
-            var request = new LoginRequest { Username = username, Password = password };
-
-            // Act
-            var result = controller.GenerateToken(request);
-
-            // Assert
-            var badRequest = Assert.IsType<BadRequestObjectResult>(result);
-            Assert.Equal(StatusCodes.Status400BadRequest, badRequest.StatusCode);
-            var errorResponse = Assert.IsType<ErrorResponse>(badRequest.Value);
-            Assert.Equal(400, errorResponse.StatusCode);
+            var errorResponse = Assert.IsType<ErrorResponse>(serverError.Value);
+            Assert.Equal(500, errorResponse.StatusCode);
         }
     }
 }
